@@ -21,6 +21,11 @@ no prefix matching, case folding, fuzzy matching or alias resolution.
 """
 
 
+def _action_match(pattern, action):
+    """Match an action against an exact name or the single wildcard *."""
+    return pattern == "*" or pattern == action
+
+
 def expand_roles(user, role_graph):
     """Return the transitive role closure for a user.
 
@@ -33,7 +38,17 @@ def expand_roles(user, role_graph):
     still returned here; filtering disabled roles belongs to the permission
     evaluation functions. Tolerance is zero: names are compared exactly.
     """
-    raise NotImplementedError("expand_roles is not implemented")
+    expanded = set()
+    stack = list(user.get("roles", ()))
+    while stack:
+        role = stack.pop()
+        if role in expanded:
+            continue
+        expanded.add(role)
+        node = role_graph.get(role)
+        if node:
+            stack.extend(node.get("parents", ()))
+    return expanded
 
 
 def resource_match(pattern, resource):
@@ -46,7 +61,17 @@ def resource_match(pattern, resource):
     is no prefix match, no implicit suffix wildcard and no fuzzy comparison,
     because all matching tolerance is zero.
     """
-    raise NotImplementedError("resource_match is not implemented")
+    pattern_segments = pattern.split("/")
+    resource_segments = resource.split("/")
+    if len(pattern_segments) != len(resource_segments):
+        return False
+    for pat, seg in zip(pattern_segments, resource_segments):
+        if pat == "*":
+            if not seg:
+                return False
+        elif pat != seg:
+            return False
+    return True
 
 
 def allow(user, action, resource, policy):
@@ -65,7 +90,32 @@ def allow(user, action, resource, policy):
     resource is matched with resource_match. Tolerance is zero: no prefix,
     role name, case or typo leniency is applied.
     """
-    raise NotImplementedError("allow is not implemented")
+    record = policy.get("users", {}).get(user)
+    if record is None or record.get("disabled", False):
+        return False
+    role_graph = policy.get("roles", {})
+    permissions = policy.get("permissions", {})
+    roles = expand_roles(record, role_graph)
+    matched_allows = []
+    matched_denies = []
+    for role in roles:
+        node = role_graph.get(role)
+        if node is None or node.get("disabled", False):
+            continue
+        rules = permissions.get(role, {})
+        for action_pat, resource_pat in rules.get("allow", ()):
+            if _action_match(action_pat, action) and resource_match(
+                resource_pat, resource
+            ):
+                matched_allows.append((action_pat, resource_pat))
+        for action_pat, resource_pat in rules.get("deny", ()):
+            if _action_match(action_pat, action) and resource_match(
+                resource_pat, resource
+            ):
+                matched_denies.append((action_pat, resource_pat))
+    if deny_wins(matched_allows, matched_denies):
+        return False
+    return bool(matched_allows)
 
 
 def deny_wins(allows, denies):
@@ -76,7 +126,7 @@ def deny_wins(allows, denies):
     must inspect denies regardless of whether allows is empty; a deny must
     never be ignored just because an allow was found.
     """
-    raise NotImplementedError("deny_wins is not implemented")
+    return bool(denies)
 
 
 def validate_graph(role_graph):
@@ -92,7 +142,32 @@ def validate_graph(role_graph):
 
     A well formed graph returns an empty list. The input is not mutated.
     """
-    raise NotImplementedError("validate_graph is not implemented")
+    issues = []
+
+    def reaches_self(start):
+        seen = set()
+        stack = [start]
+        while stack:
+            role = stack.pop()
+            for parent in role_graph.get(role, {}).get("parents", ()):
+                if parent == start:
+                    return True
+                if parent not in seen:
+                    seen.add(parent)
+                    stack.append(parent)
+        return False
+
+    for role in sorted(role_graph):
+        if not role:
+            issues.append("empty role name")
+            continue
+        node = role_graph[role]
+        for parent in sorted(node.get("parents", ())):
+            if parent not in role_graph:
+                issues.append("unknown parent: %s -> %s" % (role, parent))
+        if reaches_self(role):
+            issues.append("cycle: %s" % role)
+    return issues
 
 
 def effective_permissions(user, policy):
@@ -104,7 +179,29 @@ def effective_permissions(user, policy):
     rule matches its action and resource, so deny overrides allow. The
     result is a set, so duplicate grants collapse. Tolerance is zero.
     """
-    raise NotImplementedError("effective_permissions is not implemented")
+    record = policy.get("users", {}).get(user)
+    if record is None or record.get("disabled", False):
+        return set()
+    role_graph = policy.get("roles", {})
+    permissions = policy.get("permissions", {})
+    allows = set()
+    denies = []
+    for role in expand_roles(record, role_graph):
+        node = role_graph.get(role)
+        if node is None or node.get("disabled", False):
+            continue
+        rules = permissions.get(role, {})
+        allows.update(rules.get("allow", ()))
+        denies.extend(rules.get("deny", ()))
+    return {
+        (action, resource)
+        for action, resource in allows
+        if not any(
+            _action_match(deny_action, action)
+            and resource_match(deny_resource, resource)
+            for deny_action, deny_resource in denies
+        )
+    }
 
 
 def audit_grant(user, policy):
@@ -116,7 +213,31 @@ def audit_grant(user, policy):
     produce no lines. Allow pairs cancelled by a deny rule are omitted.
     The result is deterministic, sorted and free of duplicates.
     """
-    raise NotImplementedError("audit_grant is not implemented")
+    record = policy.get("users", {}).get(user)
+    if record is None or record.get("disabled", False):
+        return []
+    role_graph = policy.get("roles", {})
+    permissions = policy.get("permissions", {})
+    grants = []
+    denies = []
+    for role in expand_roles(record, role_graph):
+        node = role_graph.get(role)
+        if node is None or node.get("disabled", False):
+            continue
+        rules = permissions.get(role, {})
+        for action, resource in rules.get("allow", ()):
+            grants.append((role, action, resource))
+        denies.extend(rules.get("deny", ()))
+    lines = {
+        "%s:%s:%s" % (role, action, resource)
+        for role, action, resource in grants
+        if not any(
+            _action_match(deny_action, action)
+            and resource_match(deny_resource, resource)
+            for deny_action, deny_resource in denies
+        )
+    }
+    return sorted(lines)
 
 
 def perm_batch(requests, policy):
@@ -127,4 +248,12 @@ def perm_batch(requests, policy):
     role set or decision from one request never affects another user. A
     later request carrying a duplicate id overwrites the earlier result.
     """
-    raise NotImplementedError("perm_batch is not implemented")
+    results = {}
+    for request in requests:
+        results[request["id"]] = allow(
+            request["user"],
+            request["action"],
+            request["resource"],
+            policy,
+        )
+    return results
